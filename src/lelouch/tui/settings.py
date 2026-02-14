@@ -197,6 +197,7 @@ class SettingsScreen:
         table.add_row("  Text API key", self._mask_key(cfg.llm.api_key))
         table.add_row("  Vision model", cfg.llm.vision_model)
         table.add_row("  Vision API key", self._mask_key(cfg.llm.vision_api_key))
+        table.add_row("  Agentic mode", "ON" if cfg.llm.agentic_mode else "OFF")
 
         self.console.print(
             Panel(
@@ -319,6 +320,7 @@ class SettingsScreen:
             self.console.clear()
             self._print_header()
 
+            agentic_label = "ON" if self.config.llm.agentic_mode else "OFF"
             choice = questionary.select(
                 "What would you like to configure?",
                 choices=[
@@ -326,6 +328,7 @@ class SettingsScreen:
                     questionary.Choice("  Text API key", value="text_api_key"),
                     questionary.Choice("  Vision model", value="vision_model"),
                     questionary.Choice("  Vision API key", value="vision_api_key"),
+                    questionary.Choice(f"  Agentic mode [{agentic_label}]", value="agentic_mode"),
                     questionary.Choice("  Done", value="_done"),
                 ],
                 style=MENU_STYLE,
@@ -341,5 +344,9 @@ class SettingsScreen:
                 self._configure_api_key("text")
             elif choice == "vision_api_key":
                 self._configure_api_key("vision")
+            elif choice == "agentic_mode":
+                self.config.llm.agentic_mode = not self.config.llm.agentic_mode
+                state = "ON" if self.config.llm.agentic_mode else "OFF"
+                self.console.print(f"[green]Agentic mode {state}[/green]")
 
         return self.config

@@ -33,6 +33,8 @@ class LLMConfig(BaseModel):
     vision_api_key: Optional[str] = None
     vision_api_base: Optional[str] = None
 
+    agentic_mode: bool = True
+
 
 class Config(BaseModel):
     """Top-level application configuration."""

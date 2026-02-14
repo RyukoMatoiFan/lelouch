@@ -8,9 +8,10 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 import litellm
+from litellm import ModelResponse
 
 from .config import TEMPERATURE, MAX_TOKENS, LLM_TIMEOUT, Config
 
@@ -183,6 +184,39 @@ class LLMClient:
 
         response = litellm.completion(**kwargs)
         return response.choices[0].message.content
+
+    def generate_with_tools(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        tool_choice: str = "auto",
+    ) -> ModelResponse:
+        """LLM completion with tool calling support via LiteLLM.
+
+        Args:
+            messages: Full conversation history (system/user/assistant/tool messages).
+            tools: Tool definitions in OpenAI function calling format.
+            tool_choice: "auto", "required", or "none".
+
+        Returns:
+            Raw ModelResponse — caller manages message history.
+        """
+        kwargs = {
+            "model": self.text_model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "temperature": TEMPERATURE,
+            "max_tokens": MAX_TOKENS,
+            "timeout": LLM_TIMEOUT,
+        }
+
+        if self.text_api_key:
+            kwargs["api_key"] = self.text_api_key
+        if _should_pass_api_base(self.text_model, self.text_api_base):
+            kwargs["api_base"] = self.text_api_base
+
+        return litellm.completion(**kwargs)
 
     def generate_json(
         self, prompt: str, system_prompt: Optional[str] = None

@@ -43,6 +43,7 @@ def _print_settings(cfg: Config) -> None:
     table.add_row("  Text API key", _mask_key(cfg.llm.api_key))
     table.add_row("  Vision model", cfg.llm.vision_model)
     table.add_row("  Vision API key", _mask_key(cfg.llm.vision_api_key))
+    table.add_row("  Agentic mode", "ON" if cfg.llm.agentic_mode else "OFF")
 
     console.print(
         Panel(

@@ -1,4 +1,4 @@
-"""Core agentic harvester loop: search -> download -> analyze -> clip."""
+"""Core agentic harvester loop using LLM tool calling."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..config import (
     DOWNLOAD_TIMEOUT,
@@ -28,11 +28,50 @@ from ..models.harvest import (
 from .frame_analyzer import FrameAnalyzer
 from .harvest_memory import HarvestMemory
 from .search import VideoSearcher
+from .tool_defs import HARVEST_TOOLS
 from .video_clipper import VideoClipper
 
 logger = logging.getLogger(__name__)
 
 EventCallback = Callable[..., None]
+
+MAX_AGENT_TURNS = 50
+
+AGENT_SYSTEM_PROMPT = """\
+You are an autonomous video harvester agent. Your job is to find and collect \
+video footage matching the user's request by searching the web, processing \
+promising videos, and clipping matching segments.
+
+## Available tools
+
+- **search_videos(query)**: Search the web for videos. Always include "video" in queries. \
+Use diverse phrasing, synonyms, and platform targeting (e.g. site:youtube.com). \
+Each call returns a batch of candidates.
+- **process_video(url, title)**: Download, analyze with vision AI, and auto-clip a video. \
+Returns whether it matched and clip details. This is expensive — only process \
+videos whose titles look promising.
+- **check_progress()**: See current stats (duration collected, clips, rejections).
+- **finish_harvest(reason)**: Signal that you're done. Call this when target duration \
+is reached, returns are diminishing, or you've exhausted useful strategies.
+
+## Strategy
+
+1. Start with a search using the user's own words (+ "video"), then broaden.
+2. Review search results and pick the most promising candidates by title.
+3. Process one video at a time. Check progress after each to see if target is met.
+4. If a search yields no good results, try different keywords, synonyms, or platforms.
+5. Vary your queries — don't repeat the same search twice.
+6. If a platform keeps failing, switch to others (YouTube is most reliable).
+7. Stop when: target duration is reached, or you've tried many queries with diminishing returns.
+
+## Important
+
+- You choose which videos to process and in what order — be selective based on titles.
+- You decide when to search again vs. process more candidates from previous results.
+- Call finish_harvest when done — don't just stop responding."""
+
+
+# ── Fallback: old hardcoded loop (used when model lacks tool support) ────
 
 QUERY_GEN_SYSTEM_PROMPT = """\
 You are an expert search query generator for finding individual, downloadable video clips on the internet.
@@ -84,11 +123,18 @@ class VideoHarvester:
         # Track consecutive failures per platform to skip broken ones
         self._platform_fails: dict[str, int] = {}
         self._platform_fail_limit = 2  # skip platform after N consecutive failures
+        # Agent loop state
+        self._request: Optional[HarvestRequest] = None
+        self._stop = False
+        # Cache search results for the agent to pick from
+        self._pending_candidates: List[VideoCandidate] = []
 
     # ── Public API ───────────────────────────────────────────────────
 
     def harvest(self, request: HarvestRequest) -> HarvestResult:
-        """Run the full autonomous harvest loop."""
+        """Run the autonomous harvest loop using LLM tool calling."""
+        self._request = request
+        self._stop = False
         os.makedirs(request.output_dir, exist_ok=True)
 
         # Temp dirs inside output so user can find / clean them
@@ -100,6 +146,210 @@ class VideoHarvester:
 
         self.emit("start", request)
 
+        if self.config.llm.agentic_mode:
+            try:
+                self._run_agent_loop(request)
+            except Exception as e:
+                # If tool calling fails entirely (model doesn't support it),
+                # fall back to the old hardcoded loop
+                err_msg = str(e).lower()
+                if "tools" in err_msg or "tool" in err_msg or "function" in err_msg:
+                    logger.warning(
+                        "Tool calling not supported by model, falling back to legacy loop: %s", e
+                    )
+                    self.emit("log", "Model doesn't support tool calling, using legacy mode.")
+                    self._run_legacy_loop(request)
+                else:
+                    raise
+        else:
+            self._run_legacy_loop(request)
+
+        result = self._build_result(request)
+        self.emit("complete", result)
+        self._cleanup()
+        return result
+
+    # ── Agent loop (tool calling) ────────────────────────────────────
+
+    def _run_agent_loop(self, request: HarvestRequest) -> None:
+        """LLM-driven agent loop: the model decides which tools to call."""
+        criteria_str = ", ".join(request.content_criteria) if request.content_criteria else request.description
+        user_msg = (
+            f"Find {request.target_duration:.0f} seconds of video footage.\n"
+            f"Description: {request.description}\n"
+            f"Content criteria: {criteria_str}\n\n"
+            f"Start by searching, then process the most promising results."
+        )
+
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ]
+
+        for turn in range(MAX_AGENT_TURNS):
+            if self._stop:
+                break
+            if self.memory.total_duration >= request.target_duration:
+                self.emit("log", "Target duration reached.")
+                break
+
+            response = self.llm.generate_with_tools(messages, HARVEST_TOOLS)
+            assistant_msg = response.choices[0].message
+
+            # Append the assistant message to history
+            messages.append(assistant_msg.model_dump(exclude_none=True))
+
+            tool_calls = assistant_msg.tool_calls
+            if not tool_calls:
+                # No tool calls — model is done or just chatting
+                if assistant_msg.content:
+                    self.emit("log", f"Agent: {assistant_msg.content[:120]}")
+                break
+
+            for tc in tool_calls:
+                fn_name = tc.function.name
+                try:
+                    fn_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+                except json.JSONDecodeError:
+                    fn_args = {}
+
+                self.emit("log", f"Tool: {fn_name}({json.dumps(fn_args)[:100]})")
+                result_str = self._execute_tool(fn_name, fn_args)
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result_str,
+                })
+
+        else:
+            self.emit("log", f"Reached max agent turns ({MAX_AGENT_TURNS}), stopping.")
+
+    def _execute_tool(self, name: str, args: Dict[str, Any]) -> str:
+        """Dispatch a tool call to the appropriate backend."""
+        try:
+            if name == "search_videos":
+                return self._tool_search_videos(args.get("query", ""))
+            elif name == "process_video":
+                return self._tool_process_video(
+                    args.get("url", ""),
+                    args.get("title", ""),
+                )
+            elif name == "check_progress":
+                return self._tool_check_progress()
+            elif name == "finish_harvest":
+                return self._tool_finish_harvest(args.get("reason", ""))
+            else:
+                return json.dumps({"error": f"Unknown tool: {name}"})
+        except Exception as e:
+            logger.warning("Tool %s failed: %s", name, e)
+            return json.dumps({"error": str(e)[:300]})
+
+    # ── Tool implementations ─────────────────────────────────────────
+
+    def _tool_search_videos(self, query: str) -> str:
+        """search_videos tool: DDG search + prefilter, return candidates."""
+        self.emit("searching", query)
+        results = self.searcher.search(query, max_results=MAX_CANDIDATES_PER_ITERATION)
+        self.emit("search_done", query, len(results))
+
+        results = self._prefilter(results)
+        self.memory.add_candidates(results)
+        self.memory.tried_queries.append(query)
+        self.emit("candidates_found", len(results))
+
+        # Store for the agent to reference
+        self._pending_candidates.extend(results)
+
+        candidates_out = []
+        for c in results:
+            entry: Dict[str, Any] = {
+                "url": c.url,
+                "title": c.title,
+                "platform": c.platform,
+            }
+            if c.duration:
+                entry["duration"] = c.duration
+            candidates_out.append(entry)
+
+        return json.dumps({
+            "candidates_found": len(candidates_out),
+            "candidates": candidates_out,
+        })
+
+    def _tool_process_video(self, url: str, title: str = "") -> str:
+        """process_video tool: download → keyframes → vision → auto-clip."""
+        if not url:
+            return json.dumps({"error": "No URL provided"})
+
+        # Build a VideoCandidate from the URL
+        candidate = None
+        for c in self._pending_candidates:
+            if c.url == url:
+                candidate = c
+                break
+
+        if not candidate:
+            from .search import _detect_platform
+            candidate = VideoCandidate(
+                url=url,
+                title=title or "Unknown",
+                platform=_detect_platform(url),
+            )
+
+        self.emit("evaluating", candidate)
+        self._evaluate_candidate(candidate, self._request)
+
+        # Build result summary
+        # Check if the URL ended up accepted or rejected
+        if any(clip.source_url == url for clip in self.memory.accepted_clips):
+            accepted = [c for c in self.memory.accepted_clips if c.source_url == url]
+            total_clip_dur = sum(c.duration for c in accepted)
+            return json.dumps({
+                "matched": True,
+                "clips_created": len(accepted),
+                "clip_duration": round(total_clip_dur, 1),
+                "confidence": round(accepted[0].confidence, 2) if accepted else 0,
+                "total_collected": round(self.memory.total_duration, 1),
+                "target": self._request.target_duration,
+            })
+        else:
+            reason = self.memory.rejected.get(url, "Unknown reason")
+            return json.dumps({
+                "matched": False,
+                "reason": reason[:200],
+                "total_collected": round(self.memory.total_duration, 1),
+                "target": self._request.target_duration,
+            })
+
+    def _tool_check_progress(self) -> str:
+        """check_progress tool: return current harvest state."""
+        ctx = self.memory.get_llm_context()
+        return json.dumps({
+            "total_collected": round(self.memory.total_duration, 1),
+            "target": self._request.target_duration if self._request else 0,
+            "clips_accepted": len(self.memory.accepted_clips),
+            "candidates_evaluated": len(self.memory.found_candidates),
+            "candidates_rejected": len(self.memory.rejected),
+            "queries_tried": self.memory.tried_queries,
+            "summary": ctx,
+        })
+
+    def _tool_finish_harvest(self, reason: str) -> str:
+        """finish_harvest tool: signal completion."""
+        self._stop = True
+        self.emit("log", f"Agent finished: {reason}")
+        return json.dumps({
+            "status": "harvest_complete",
+            "reason": reason,
+            "total_collected": round(self.memory.total_duration, 1),
+            "clips": len(self.memory.accepted_clips),
+        })
+
+    # ── Legacy loop (fallback when tool calling unavailable) ─────────
+
+    def _run_legacy_loop(self, request: HarvestRequest) -> None:
+        """Original hardcoded loop: generate queries → search → evaluate."""
         while self.memory.total_duration < request.target_duration:
             if self.memory.iteration >= request.max_iterations:
                 self.emit(
@@ -142,11 +392,6 @@ class VideoHarvester:
                 self._evaluate_candidate(candidate, request)
 
             self.emit("iteration_end", self.memory)
-
-        result = self._build_result(request)
-        self.emit("complete", result)
-        self._cleanup()
-        return result
 
     # ── Private helpers ──────────────────────────────────────────────
 
