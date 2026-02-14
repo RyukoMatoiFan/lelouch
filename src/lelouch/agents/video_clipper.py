@@ -52,6 +52,7 @@ class VideoClipper:
 
     def __init__(self):
         self._progress_hook = None
+        self.format_override: str | None = None
 
     def set_progress_hook(self, hook):
         """Set a callback for download progress: hook(downloaded_mb, pct, speed, eta)."""
@@ -76,23 +77,24 @@ class VideoClipper:
             return info
 
     def download_video(
-        self, url: str, output_path: str, timeout: int = 120
+        self, url: str, output_path: str, timeout: int = 120, retries: int = 1,
     ) -> str:
         """Download a video using yt-dlp.
 
         Returns the path to the downloaded file.
         Raises RuntimeError if the download fails or produces an empty file.
         """
+        fmt = self.format_override or _FORMAT
         ydl_opts = {
-            "format": _FORMAT,
+            "format": fmt,
             "outtmpl": output_path,
             "quiet": True,
             "no_warnings": True,
             "socket_timeout": min(timeout, 20),
-            "retries": 1,
-            "fragment_retries": 1,
-            "extractor_retries": 1,
-            "file_access_retries": 1,
+            "retries": retries,
+            "fragment_retries": retries,
+            "extractor_retries": retries,
+            "file_access_retries": retries,
             "no_check_certificates": True,
             "logger": _ydl_logger,
         }

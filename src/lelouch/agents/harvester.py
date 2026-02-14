@@ -54,6 +54,29 @@ videos whose titles look promising.
 - **finish_harvest(reason)**: Signal that you're done. Call this when target duration \
 is reached, returns are diminishing, or you've exhausted useful strategies.
 
+## Adaptive tools
+
+- **refine_criteria(criteria, reasoning)**: Update what the vision model looks for. \
+Use when rejections show a pattern (e.g. "no X found" repeated 3+ times). \
+You can broaden ("blonde" → "blonde or light-haired"), narrow, or refocus.
+- **adjust_confidence(min_confidence)**: Change the acceptance threshold (0.1–0.9). \
+Lower if good-looking videos are borderline rejected. Raise if junk gets through.
+- **get_rejection_analysis()**: See WHY videos are being rejected, grouped by pattern. \
+Use this before refining criteria — understand the problem first.
+
+## Pipeline control tools
+
+- **set_download_options(timeout, retries)**: Adjust download timeout (10–600s) and retries (1–5). \
+Increase retries if downloads keep failing due to flaky connections.
+- **adjust_frame_sampling(num_frames)**: Change keyframe count (4–24, default 12). \
+Use more frames for long videos, fewer for short ones to save analysis cost.
+- **re_enable_platform(platform)**: Re-enable a platform disabled after repeated failures. \
+Use when a platform may have been temporarily down.
+- **set_video_quality(resolution)**: Set download quality ('360p', '480p', '720p', '1080p'). \
+Higher quality improves vision analysis but slows downloads.
+- **set_max_video_duration(max_seconds)**: Change the per-video duration limit (60–7200s). \
+Auto-scales to target duration. Raise if long videos are being skipped unnecessarily.
+
 ## Strategy
 
 1. Start with a search using the user's own words (+ "video"), then broaden.
@@ -63,6 +86,16 @@ is reached, returns are diminishing, or you've exhausted useful strategies.
 5. Vary your queries — don't repeat the same search twice.
 6. If a platform keeps failing, switch to others (YouTube is most reliable).
 7. Stop when: target duration is reached, or you've tried many queries with diminishing returns.
+
+## Adaptive strategy
+
+- After 3+ rejections, call get_rejection_analysis to understand patterns.
+- If content mismatches dominate, refine_criteria to better match available content.
+- If confidence is borderline, adjust_confidence slightly (±0.05–0.10).
+- Don't change criteria on the first rejection — wait for a pattern.
+- If downloads keep failing, try set_download_options with more retries before giving up.
+- Use adjust_frame_sampling(16–20) for longer videos where 12 frames may miss content.
+- If vision analysis seems poor, try set_video_quality('720p') for better frames.
 
 ## Important
 
@@ -128,6 +161,12 @@ class VideoHarvester:
         self._stop = False
         # Cache search results for the agent to pick from
         self._pending_candidates: List[VideoCandidate] = []
+        # Mutable runtime overrides (set per-harvest in harvest())
+        self._effective_confidence: float = MIN_CONFIDENCE
+        self._effective_criteria: List[str] = []
+        self._effective_timeout: int = DOWNLOAD_TIMEOUT
+        self._effective_retries: int = 1
+        self._effective_max_duration: float = 0  # set per-harvest based on target
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -135,6 +174,13 @@ class VideoHarvester:
         """Run the autonomous harvest loop using LLM tool calling."""
         self._request = request
         self._stop = False
+        self._effective_confidence = MIN_CONFIDENCE
+        self._effective_criteria = list(request.content_criteria) if request.content_criteria else []
+        self._effective_timeout = DOWNLOAD_TIMEOUT
+        self._effective_retries = 1
+        from .video_clipper import MAX_VIDEO_DURATION
+        self._effective_max_duration = max(MAX_VIDEO_DURATION, request.target_duration)
+        self.clipper.format_override = None
         os.makedirs(request.output_dir, exist_ok=True)
 
         # Temp dirs inside output so user can find / clean them
@@ -239,6 +285,28 @@ class VideoHarvester:
                 return self._tool_check_progress()
             elif name == "finish_harvest":
                 return self._tool_finish_harvest(args.get("reason", ""))
+            elif name == "refine_criteria":
+                return self._tool_refine_criteria(
+                    args.get("criteria", []),
+                    args.get("reasoning", ""),
+                )
+            elif name == "adjust_confidence":
+                return self._tool_adjust_confidence(args.get("min_confidence", MIN_CONFIDENCE))
+            elif name == "get_rejection_analysis":
+                return self._tool_get_rejection_analysis()
+            elif name == "set_download_options":
+                return self._tool_set_download_options(
+                    args.get("timeout"),
+                    args.get("retries"),
+                )
+            elif name == "adjust_frame_sampling":
+                return self._tool_adjust_frame_sampling(args.get("num_frames", 12))
+            elif name == "re_enable_platform":
+                return self._tool_re_enable_platform(args.get("platform", ""))
+            elif name == "set_video_quality":
+                return self._tool_set_video_quality(args.get("resolution", "480p"))
+            elif name == "set_max_video_duration":
+                return self._tool_set_max_video_duration(args.get("max_seconds", 1800))
             else:
                 return json.dumps({"error": f"Unknown tool: {name}"})
         except Exception as e:
@@ -346,6 +414,160 @@ class VideoHarvester:
             "clips": len(self.memory.accepted_clips),
         })
 
+    def _tool_refine_criteria(self, criteria: List[str], reasoning: str) -> str:
+        """refine_criteria tool: update what the vision model looks for."""
+        if not criteria:
+            return json.dumps({"error": "criteria list cannot be empty"})
+        old_criteria = list(self._effective_criteria)
+        self._effective_criteria = criteria
+        self.emit("log", f"Criteria refined: {old_criteria} -> {criteria} ({reasoning})")
+        return json.dumps({
+            "status": "criteria_updated",
+            "old_criteria": old_criteria,
+            "new_criteria": criteria,
+            "reasoning": reasoning,
+        })
+
+    def _tool_adjust_confidence(self, min_confidence: float) -> str:
+        """adjust_confidence tool: change the acceptance threshold."""
+        clamped = max(0.1, min(0.9, min_confidence))
+        old = self._effective_confidence
+        self._effective_confidence = clamped
+        self.emit("log", f"Confidence threshold: {old:.2f} -> {clamped:.2f}")
+        return json.dumps({
+            "status": "confidence_updated",
+            "old_threshold": round(old, 2),
+            "new_threshold": round(clamped, 2),
+        })
+
+    def _tool_get_rejection_analysis(self) -> str:
+        """get_rejection_analysis tool: group rejections by pattern."""
+        categories: Dict[str, List[str]] = {
+            "content_mismatch": [],
+            "low_confidence": [],
+            "download_failure": [],
+            "platform_error": [],
+            "duration_issue": [],
+            "other": [],
+        }
+
+        for url, reason in self.memory.rejected.items():
+            lower = reason.lower()
+            if any(kw in lower for kw in (
+                "no match", "not found", "doesn't match", "does not match",
+                "no relevant", "content mismatch", "no .* found",
+            )):
+                categories["content_mismatch"].append(reason)
+            elif any(kw in lower for kw in ("confidence", "low confidence")):
+                categories["low_confidence"].append(reason)
+            elif any(kw in lower for kw in (
+                "download", "timeout", "connection", "network", "http",
+            )):
+                categories["download_failure"].append(reason)
+            elif any(kw in lower for kw in (
+                "unsupported", "platform", "unavailable", "private",
+                "removed", "blocked", "geo", "age", "skipping",
+            )):
+                categories["platform_error"].append(reason)
+            elif any(kw in lower for kw in ("too long", "too short", "duration")):
+                categories["duration_issue"].append(reason)
+            else:
+                categories["other"].append(reason)
+
+        summary: Dict[str, Any] = {}
+        for cat, reasons in categories.items():
+            if reasons:
+                # Deduplicate example reasons
+                unique = list(dict.fromkeys(reasons))
+                summary[cat] = {
+                    "count": len(reasons),
+                    "examples": unique[:3],
+                }
+
+        return json.dumps({
+            "total_rejected": len(self.memory.rejected),
+            "current_confidence_threshold": round(self._effective_confidence, 2),
+            "current_criteria": self._effective_criteria,
+            "categories": summary,
+        })
+
+    def _tool_set_download_options(
+        self, timeout: Optional[int] = None, retries: Optional[int] = None,
+    ) -> str:
+        """set_download_options tool: configure download timeout and retries."""
+        changes: Dict[str, Any] = {}
+        if timeout is not None:
+            old_timeout = self._effective_timeout
+            self._effective_timeout = max(10, min(600, timeout))
+            changes["timeout"] = {"old": old_timeout, "new": self._effective_timeout}
+        if retries is not None:
+            old_retries = self._effective_retries
+            self._effective_retries = max(1, min(5, retries))
+            changes["retries"] = {"old": old_retries, "new": self._effective_retries}
+        if not changes:
+            return json.dumps({"error": "No options provided (specify timeout and/or retries)"})
+        self.emit("log", f"Download options updated: {changes}")
+        return json.dumps({"status": "download_options_updated", **changes})
+
+    def _tool_adjust_frame_sampling(self, num_frames: int) -> str:
+        """adjust_frame_sampling tool: change keyframe count for vision analysis."""
+        clamped = max(4, min(24, num_frames))
+        old = self.analyzer.num_frames
+        self.analyzer.num_frames = clamped
+        self.emit("log", f"Frame sampling: {old} -> {clamped} keyframes")
+        return json.dumps({
+            "status": "frame_sampling_updated",
+            "old_num_frames": old,
+            "new_num_frames": clamped,
+        })
+
+    def _tool_re_enable_platform(self, platform: str) -> str:
+        """re_enable_platform tool: reset failure counter for a platform."""
+        if not platform:
+            return json.dumps({"error": "No platform specified"})
+        old_fails = self._platform_fails.get(platform, 0)
+        self._platform_fails[platform] = 0
+        self.emit("log", f"Re-enabled platform: {platform} (was at {old_fails} failures)")
+        return json.dumps({
+            "status": "platform_re_enabled",
+            "platform": platform,
+            "previous_failures": old_fails,
+        })
+
+    _QUALITY_FORMATS = {
+        "360p": "18/best[height<=360]/best",
+        "480p": "18/22/best[height<=480]/best",
+        "720p": "22/best[height<=720]/best",
+        "1080p": "best[height<=1080]/best",
+    }
+
+    def _tool_set_video_quality(self, resolution: str) -> str:
+        """set_video_quality tool: change yt-dlp format selector."""
+        resolution = resolution.lower().strip()
+        fmt = self._QUALITY_FORMATS.get(resolution)
+        if not fmt:
+            return json.dumps({
+                "error": f"Unknown resolution '{resolution}'. Use: 360p, 480p, 720p, or 1080p",
+            })
+        self.clipper.format_override = fmt
+        self.emit("log", f"Video quality set to {resolution}")
+        return json.dumps({
+            "status": "video_quality_updated",
+            "resolution": resolution,
+        })
+
+    def _tool_set_max_video_duration(self, max_seconds: int) -> str:
+        """set_max_video_duration tool: change per-video duration limit."""
+        clamped = max(60, min(7200, max_seconds))
+        old = self._effective_max_duration
+        self._effective_max_duration = clamped
+        self.emit("log", f"Max video duration: {old:.0f}s -> {clamped}s")
+        return json.dumps({
+            "status": "max_duration_updated",
+            "old_max_seconds": round(old),
+            "new_max_seconds": clamped,
+        })
+
     # ── Legacy loop (fallback when tool calling unavailable) ─────────
 
     def _run_legacy_loop(self, request: HarvestRequest) -> None:
@@ -419,13 +641,12 @@ class VideoHarvester:
             # Pre-check: extract info to get duration (fast, no download)
             self.emit("checking_info", candidate)
             try:
-                from .video_clipper import MAX_VIDEO_DURATION
                 info = self.clipper.get_video_info(candidate.url)
                 vid_duration = info.get("duration") or 0
                 self.emit("info_ready", candidate, vid_duration)
 
-                if vid_duration > MAX_VIDEO_DURATION:
-                    reason = f"Too long ({vid_duration:.0f}s > {MAX_VIDEO_DURATION}s limit)"
+                if vid_duration > self._effective_max_duration:
+                    reason = f"Too long ({vid_duration:.0f}s > {self._effective_max_duration:.0f}s limit)"
                     self.memory.add_rejected(candidate.url, reason)
                     self.emit("clip_rejected", candidate, reason)
                     return
@@ -456,15 +677,15 @@ class VideoHarvester:
             video_path = self.clipper.download_video(
                 candidate.url,
                 video_path,
-                timeout=DOWNLOAD_TIMEOUT,
+                timeout=self._effective_timeout,
+                retries=self._effective_retries,
             )
             self.emit("downloaded", candidate)
 
             # Keyframe extraction → grid mosaic
             self.emit("extracting_frames", candidate)
             frames = self.analyzer.extract_keyframes(video_path)
-            from .frame_analyzer import GRID_FRAMES
-            self.emit("keyframes_extracted", GRID_FRAMES)
+            self.emit("keyframes_extracted", self.analyzer.num_frames)
 
             # Duration
             try:
@@ -473,16 +694,18 @@ class VideoHarvester:
                 duration = candidate.duration or 60.0
 
             # LLM vision analysis (single grid image)
-            self.emit("analyzing", candidate, GRID_FRAMES)
+            # Use effective criteria (may have been refined by agent)
+            active_criteria = self._effective_criteria or request.content_criteria
+            self.emit("analyzing", candidate, self.analyzer.num_frames)
             analysis = self.analyzer.analyze(
-                frames, request.content_criteria, duration,
+                frames, active_criteria, duration,
                 video_title=candidate.title,
             )
             self.emit("analysis_complete", analysis)
 
             if (
                 analysis.matches
-                and analysis.confidence >= MIN_CONFIDENCE
+                and analysis.confidence >= self._effective_confidence
             ):
                 clips = self._create_clips(
                     video_path, candidate, analysis, request, duration
